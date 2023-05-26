@@ -1,0 +1,13 @@
+bbcode==1.1.0
+beautifulsoup4==4.12.2
+certifi==2023.5.7
+charset-normalizer==3.1.0
+faapi==3.11.0
+htmlmin==0.1.12
+idna==3.4
+lxml==4.9.2
+python-dateutil==2.8.2
+requests==2.31.0
+six==1.16.0
+soupsieve==2.4.1
+urllib3==2.0.2
