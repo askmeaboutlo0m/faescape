@@ -44,6 +44,10 @@ class DelayedFAAPI(faapi.FAAPI):
         return delay if delay > 10 else 10
 
 
+class StopArchiving(Exception):
+    pass
+
+
 class FaArchiver:
     EXTENSION_RE = re.compile(r"(\.[^\./]+)$")
 
@@ -57,8 +61,10 @@ class FaArchiver:
         self._db_file = os.path.join(base_dir, "archive.db")
         self._api = None
         self._db = None
+        self._cancelled = False
 
     def archive(self):
+        self._check_cancelled()
         logging.info("Archiving artist '%s'", self._artist)
         self._connect_api()
         self._create_directories()
@@ -66,10 +72,19 @@ class FaArchiver:
         self._check_artist()
         self._collect_archive_elements()
         self._download_archive_elements()
+        logging.info("Done archiving artist '%s'", self._artist)
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _check_cancelled(self):
+        if self._cancelled:
+            raise StopArchiving()
 
     def _connect_api(self):
+        self._check_cancelled()
         logging.debug("Connecting API")
-        self._api = DelayedFAAPI(cookies)
+        self._api = DelayedFAAPI(self._cookies)
         self._check_logged_in()
 
     def _check_logged_in(self):
@@ -80,6 +95,7 @@ class FaArchiver:
             raise RuntimeError("Looks like you're not logged in")
 
     def _create_directories(self):
+        self._check_cancelled()
         logging.debug("Creating directories")
         self._create_directory(self._base_dir)
         self._create_directory(self._gallery_dir)
@@ -94,6 +110,7 @@ class FaArchiver:
             logging.debug("Directory '%s' already exists", directory)
 
     def _init_db(self):
+        self._check_cancelled()
         logging.debug("Initializing database '%s'", self._db_file)
         self._db = sqlite3.connect(self._db_file)
         with self._db as con:
@@ -117,6 +134,7 @@ class FaArchiver:
             )
 
     def _check_artist(self):
+        self._check_cancelled()
         db_artist = self._get_state_string("artist")
         if db_artist is None:
             self._check_artist_exists()
@@ -141,12 +159,15 @@ class FaArchiver:
     # all ids of stuff that needs to be downloaded.
 
     def _collect_archive_elements(self):
+        self._check_cancelled()
         self._collect_archive_element_type(
             "gallery", self._get_gallery_page, self._insert_submission_element
         )
+        self._check_cancelled()
         self._collect_archive_element_type(
             "scraps", self._get_scraps_page, self._insert_submission_element
         )
+        self._check_cancelled()
         self._collect_archive_element_type(
             "journals", self._get_journals_page, self._insert_journal_element
         )
@@ -189,6 +210,7 @@ class FaArchiver:
         page = 1
         all_results = []
         while True:
+            self._check_cancelled()
             page_results, next_page = get_page_fn(page)
             logging.debug("%d results on page %d", len(page_results), page)
             all_results += page_results
@@ -206,6 +228,7 @@ class FaArchiver:
 
     def _download_archive_elements(self):
         while element := self._get_next_open_archive_element():
+            self._check_cancelled()
             db_id, element_type, element_id, element_data = element
             if element_type == "gallery":
                 logging.info("Downloading gallery submission %d", element_id)
@@ -289,7 +312,11 @@ class FaArchiver:
             return row[0] if row else None
 
     def _get_state_string(self, key):
-        with contextlib.closing(self._db.cursor()) as cur:
+        return FaArchiver.get_state_string(self._db, key)
+
+    @staticmethod
+    def get_state_string(db, key):
+        with contextlib.closing(db.cursor()) as cur:
             cur.execute("select cast(value as text) from state where key = ?", (key,))
             row = cur.fetchone()
             return row[0] if row else None
@@ -329,20 +356,8 @@ class FaArchiver:
             )
 
 
-if __name__ == "__main__":
+def main_cmd(artist, base_dir):
     error = False
-
-    argc = len(sys.argv)
-    if argc == 3:
-        artist = sys.argv[1]
-        base_dir = sys.argv[2]
-    else:
-        error = True
-        logging.error(
-            "Usage: %s ARTIST_NAME_FROM_URL DIRECTORY",
-            "fa_archive" if argc < 1 else sys.argv[0],
-        )
-
     cookies = requests.cookies.RequestsCookieJar()
     for letter in ["a", "b"]:
         env_key = "FA_ARCHIVE_{}_COOKIE".format(letter.upper())
@@ -361,3 +376,227 @@ if __name__ == "__main__":
         sys.exit(2)
 
     FaArchiver(artist, base_dir, cookies).archive()
+
+
+def main_gui():
+    from logging.handlers import QueueHandler
+    from queue import Empty, SimpleQueue
+    from threading import Thread
+    from tkinter import StringVar, Tk, filedialog, messagebox
+    from tkinter.scrolledtext import ScrolledText
+    from tkinter.ttk import Button, Entry, Frame, Label
+
+    PADX = 4
+    PADY = 4
+
+    root = Tk()
+    root.winfo_toplevel().title("FurAffinity Archiver")
+    root.geometry("800x600")
+
+    frm = Frame(root)
+    frm.pack(fill="both", expand=True)
+    frm.columnconfigure(1, weight=1)
+    frm.rowconfigure(5, weight=1)
+
+    Label(frm, text="Output directory:").grid(
+        column=0, row=0, padx=PADX, pady=PADY, sticky="ew"
+    )
+    Label(frm, text="Artist:").grid(column=0, row=1, padx=PADX, pady=PADY, sticky="ew")
+    Label(frm, text="Cookie a:").grid(
+        column=0, row=2, padx=PADX, pady=PADY, sticky="ew"
+    )
+    Label(frm, text="Cookie b:").grid(
+        column=0, row=3, padx=PADX, pady=PADY, sticky="ew"
+    )
+
+    base_dir_var = StringVar()
+    base_dir_entry = Entry(frm)
+    base_dir_entry["textvariable"] = base_dir_var
+    base_dir_entry.grid(column=1, row=0, padx=PADX, pady=PADY, sticky="ew")
+
+    def guess_artist(path):
+        db_file = os.path.join(path, "archive.db")
+        if os.path.exists(db_file):
+            db = sqlite3.connect(db_file)
+            with db as con:
+                artist = FaArchiver.get_state_string(con, "artist")
+                if artist:
+                    artist_var.set(artist)
+
+    def choose_base_dir():
+        path = filedialog.askdirectory(
+            parent=root, initialdir=os.path.dirname(__file__)
+        )
+        if path:
+            base_dir_var.set(path)
+            try:
+                guess_artist(path)
+            except Exception as e:
+                logging.warning("Error guessing artist: %s", e)
+
+    choose_button = Button(frm, text="Choose...", command=choose_base_dir)
+    choose_button.grid(column=2, row=0, padx=PADX, pady=PADY)
+
+    artist_var = StringVar()
+    artist_entry = Entry(frm)
+    artist_entry["textvariable"] = artist_var
+    artist_entry.grid(column=1, row=1, columnspan=2, padx=PADX, pady=PADY, sticky="ew")
+
+    a_cookie_var = StringVar()
+    a_cookie_var.set(os.environ.get("FA_ARCHIVE_A_COOKIE", ""))
+    a_cookie_entry = Entry(frm)
+    a_cookie_entry["textvariable"] = a_cookie_var
+    a_cookie_entry.grid(
+        column=1, row=2, columnspan=2, padx=PADX, pady=PADY, sticky="ew"
+    )
+
+    b_cookie_var = StringVar()
+    b_cookie_var.set(os.environ.get("FA_ARCHIVE_B_COOKIE", ""))
+    b_cookie_entry = Entry(frm)
+    b_cookie_entry["textvariable"] = b_cookie_var
+    b_cookie_entry.grid(
+        column=1, row=3, columnspan=2, padx=PADX, pady=PADY, sticky="ew"
+    )
+
+    button_frm = Frame(frm)
+    button_frm.grid(column=0, row=4, columnspan=3, sticky="ew")
+
+    text = ScrolledText(frm, state="disabled", wrap="word")
+    text.grid(column=0, row=5, columnspan=4, padx=PADX, pady=PADY, sticky="nsew")
+
+    queue = SimpleQueue()
+    formatter = logging.Formatter("%(levelname)s: %(message)s\n")
+    logging.getLogger().addHandler(QueueHandler(queue))
+    logging.info("Fill in the fields above and press the Archive button to start.")
+    logging.info("Output directory is the folder to download stuff to.")
+    logging.info("Artist is the FurAffinity username you want to archive.")
+    logging.info(
+        "Cookie a and cookie b are your FurAffinity login cookies. "
+        + "You can probably get these out of your browser by opening the "
+        + "developer console (hit F12), opening the Network tab and visiting "
+        + "any FurAffinity page while logged in."
+    )
+    logging.warning(
+        "DO NOT SHARE YOUR LOGIN COOKIES WITH ANYONE ELSE. "
+        + "They are similar to a password. Keep them to yourself."
+    )
+
+    quit_requested = False
+    archiver_finished = False
+    archiver_instance = None
+
+    def update_log():
+        have_message = False
+        while True:
+            try:
+                record = queue.get_nowait()
+                message = formatter.format(record)
+                text["state"] = "normal"
+                try:
+                    text.insert("end", message)
+                finally:
+                    text["state"] = "disabled"
+                have_message = True
+            except Empty:
+                break
+        if have_message:
+            text.see("end")
+
+        nonlocal archiver_finished
+        if archiver_finished:
+            archiver_finished = False
+            nonlocal archiver_instance
+            archiver_instance = None
+            archive_button["text"] = "Archive"
+            if quit_requested:
+                root.destroy()
+                sys.exit(0)
+
+        root.after(100, update_log)
+
+    update_log()
+
+    def make_archiver():
+        errors = []
+        base_dir = base_dir_var.get().strip()
+        if not base_dir:
+            errors.append("Missing output directory. Choose where to archive to.")
+        artist = artist_var.get().strip()
+        if not artist:
+            errors.append("Missing artist. Enter a username.")
+        a_cookie = a_cookie_var.get().strip()
+        if not a_cookie:
+            errors.append("Missing cookie a. Get it out of your logged-in browser.")
+        b_cookie = b_cookie_var.get().strip()
+        if not b_cookie:
+            errors.append("Missing cookie b. Get it out of your logged-in browser.")
+        if errors:
+            messagebox.showerror(
+                title="Error", message="\n\n".join(errors), parent=root
+            )
+            return None
+        else:
+            cookies = requests.cookies.RequestsCookieJar()
+            cookies.set("a", a_cookie)
+            cookies.set("b", b_cookie)
+            return FaArchiver(artist, base_dir, cookies)
+
+    def run_archive_thread(archiver):
+        try:
+            logging.info("*** Archiving Started ***")
+            archiver.archive()
+        except StopArchiving:
+            logging.info("Cancelled, will pick up at this point again next time")
+        except Exception as e:
+            logging.error(str(e))
+            raise
+        finally:
+            nonlocal archiver_finished
+            archiver_finished = True
+            logging.info("*** Archiving Ended ***")
+
+    def start_cancel():
+        nonlocal archiver_instance
+        if archiver_instance:
+            logging.info(
+                "Cancelling at the next opportunity, may take 10 seconds or so..."
+            )
+            archiver_instance.cancel()
+        else:
+            archiver_instance = make_archiver()
+            if archiver_instance:
+                archive_button["text"] = "Cancel"
+                Thread(target=run_archive_thread, args=(archiver_instance,)).start()
+
+    archive_button = Button(button_frm, text="Archive", command=start_cancel)
+    archive_button.grid(column=0, row=0, padx=PADX, pady=PADY)
+
+    def request_quit():
+        if archiver_instance:
+            logging.info(
+                "Quitting at the next opportunity, may take 10 seconds or so..."
+            )
+            archiver_instance.cancel()
+            nonlocal quit_requested
+            quit_requested = True
+        else:
+            root.destroy()
+            sys.exit(0)
+
+    quit_button = Button(button_frm, text="Quit", command=request_quit)
+    quit_button.grid(column=1, row=0, padx=PADX, pady=PADY)
+    root.protocol("WM_DELETE_WINDOW", request_quit)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    argc = len(sys.argv)
+    if argc == 1:
+        main_gui()
+    elif argc == 3:
+        main_cmd(sys.argv[1], sys.argv[2])
+    else:
+        program = "fa_archive" if argc < 1 else sys.argv[0]
+        logging.error("GUI usage: %s (without arguments)", program)
+        logging.error("Command line usage: %s ARTIST_NAME_FROM_URL DIRECTORY", program)
