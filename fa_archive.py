@@ -110,6 +110,7 @@ class FaArchiver:
                     id integer primary key not null,
                     type text not null,
                     element_id integer not null,
+                    element_data,
                     archived integer not null,
                     unique (type, element_id))
                 """
@@ -140,9 +141,15 @@ class FaArchiver:
     # all ids of stuff that needs to be downloaded.
 
     def _collect_archive_elements(self):
-        self._collect_archive_element_type("gallery", self._get_gallery_page)
-        self._collect_archive_element_type("scraps", self._get_scraps_page)
-        self._collect_archive_element_type("journals", self._get_journals_page)
+        self._collect_archive_element_type(
+            "gallery", self._get_gallery_page, self._insert_submission_element
+        )
+        self._collect_archive_element_type(
+            "scraps", self._get_scraps_page, self._insert_submission_element
+        )
+        self._collect_archive_element_type(
+            "journals", self._get_journals_page, self._insert_journal_element
+        )
 
     def _get_gallery_page(self, page):
         logging.debug("Get gallery page %d", page)
@@ -156,7 +163,17 @@ class FaArchiver:
         logging.debug("Get journals page %d", page)
         return self._api.journals(self._artist, page)
 
-    def _collect_archive_element_type(self, element_type, get_page_fn):
+    def _insert_submission_element(self, con, element_type, result):
+        self._insert_archive_element(con, element_type, result.id, None)
+        if result.thumbnail_url:
+            self._insert_archive_element(
+                con, element_type + "_thumb", result.id, result.thumbnail_url
+            )
+
+    def _insert_journal_element(self, con, element_type, result):
+        self._insert_archive_element(con, element_type, result.id, None)
+
+    def _collect_archive_element_type(self, element_type, get_page_fn, insert_fn):
         state_key = "collected_{}".format(element_type)
         if self._get_state_bool(state_key):
             logging.debug("Already collected %s", element_type)
@@ -165,7 +182,7 @@ class FaArchiver:
             results = self._get_all_pages(get_page_fn)
             with self._db as con:
                 for result in results:
-                    self._insert_archive_element(con, element_type, result.id)
+                    insert_fn(con, element_type, result)
                 self._set_state(con, state_key, 1)
 
     def _get_all_pages(self, get_page_fn):
@@ -189,13 +206,19 @@ class FaArchiver:
 
     def _download_archive_elements(self):
         while element := self._get_next_open_archive_element():
-            db_id, element_type, element_id = element
+            db_id, element_type, element_id, element_data = element
             if element_type == "gallery":
                 logging.info("Downloading gallery submission %d", element_id)
                 self._download_submission(element_id, self._gallery_dir)
+            elif element_type == "gallery_thumb":
+                logging.info("Downloading gallery thumbnail %d", element_id)
+                self._download_thumbnail(element_id, element_data, self._gallery_dir)
             elif element_type == "scraps":
                 logging.info("Downloading scraps submission %d", element_id)
                 self._download_submission(element_id, self._scraps_dir)
+            elif element_type == "scraps_thumb":
+                logging.info("Downloading scraps thumbnail %d", element_id)
+                self._download_thumbnail(element_id, element_data, self._scraps_dir)
             elif element_type == "journals":
                 logging.info("Downloading journal %d", element_id)
                 self._download_journal(element_id, self._journals_dir)
@@ -209,6 +232,14 @@ class FaArchiver:
         self._spew_json(info, os.path.join(directory, "{}d.json".format(submission_id)))
         self._spew_bytes(
             data, os.path.join(directory, "{}f{}".format(submission_id, ext))
+        )
+
+    def _download_thumbnail(self, submission_id, thumbnail_url, directory):
+        self._api.handle_delay()
+        data = self._api.session.get(thumbnail_url, timeout=self._api.timeout).content
+        ext = self._extract_file_extension(thumbnail_url)
+        self._spew_bytes(
+            data, os.path.join(directory, "{}t{}".format(submission_id, ext))
         )
 
     def _download_journal(self, journal_id, directory):
@@ -272,20 +303,20 @@ class FaArchiver:
             (key, value),
         )
 
-    def _insert_archive_element(self, con, element_type, element_id):
+    def _insert_archive_element(self, con, element_type, element_id, element_data):
         con.execute(
             """
-            insert into archive_element(type, element_id, archived)
-            values (?, ?, 0)
+            insert into archive_element(type, element_id, element_data, archived)
+            values (?, ?, ?, 0)
             """,
-            (element_type, element_id),
+            (element_type, element_id, element_data),
         )
 
     def _get_next_open_archive_element(self):
         with contextlib.closing(self._db.cursor()) as cur:
             cur.execute(
                 """
-                select id, type, element_id from archive_element
+                select id, type, element_id, element_data from archive_element
                 where not archived order by id limit 1
                 """
             )
