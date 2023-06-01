@@ -63,6 +63,7 @@ class FaArchiver:
         self._connect_api()
         self._create_directories()
         self._init_db()
+        self._check_artist()
         self._collect_archive_elements()
         self._download_archive_elements()
 
@@ -70,7 +71,6 @@ class FaArchiver:
         logging.debug("Connecting API")
         self._api = DelayedFAAPI(cookies)
         self._check_logged_in()
-        self._check_artist_exists()
 
     def _check_logged_in(self):
         user = self._api.me()
@@ -78,13 +78,6 @@ class FaArchiver:
             logging.info("Logged in as '%s%s'", user.status, user.name)
         else:
             raise RuntimeError("Looks like you're not logged in")
-
-    def _check_artist_exists(self):
-        try:
-            user = self._api.user(self._artist)
-        except Exception as err:
-            raise RuntimeError("Artist '{}' not found".format(self._artist)) from err
-        logging.info("Target artist: %s%s", user.status, user.name)
 
     def _create_directories(self):
         logging.debug("Creating directories")
@@ -121,6 +114,27 @@ class FaArchiver:
                     unique (type, element_id))
                 """
             )
+
+    def _check_artist(self):
+        db_artist = self._get_state_string("artist")
+        if db_artist is None:
+            self._check_artist_exists()
+        elif db_artist.casefold() == self._artist.casefold():
+            logging.debug("Artist '%s' exists according to database", db_artist)
+        else:
+            raise RuntimeError(
+                "Directory already contains data for artist '{}'".format(db_artist)
+            )
+
+    def _check_artist_exists(self):
+        logging.debug("Checking if artist '%s' is valid", self._artist)
+        try:
+            user = self._api.user(self._artist)
+        except Exception as err:
+            raise RuntimeError("Artist '{}' not found".format(self._artist)) from err
+        logging.info("Target artist: %s%s", user.status, user.name)
+        with self._db as con:
+            self._set_state(con, "artist", self._artist)
 
     # "Collection" of archive elements: going through the pages and grabbing
     # all ids of stuff that needs to be downloaded.
@@ -240,6 +254,12 @@ class FaArchiver:
             cur.execute(
                 "select cast(value as integer) from state where key = ?", (key,)
             )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def _get_state_string(self, key):
+        with contextlib.closing(self._db.cursor()) as cur:
+            cur.execute("select cast(value as text) from state where key = ?", (key,))
             row = cur.fetchone()
             return row[0] if row else None
 
