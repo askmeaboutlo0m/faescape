@@ -35,13 +35,13 @@ logging.basicConfig(
 )
 
 
-# We're not in a hurry, delay every request by at least 10 seconds so that we
+# We're not in a hurry, delay every request by at least 5 seconds so that we
 # don't get banned for blasting FA too fast.
 class DelayedFAAPI(faapi.FAAPI):
     @faapi.FAAPI.crawl_delay.getter
     def crawl_delay(self):
         delay = faapi.FAAPI.crawl_delay.fget(self)
-        return delay if delay > 10 else 10
+        return delay if delay > 5 else 5
 
 
 class StopArchiving(Exception):
