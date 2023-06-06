@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import requests
+import shutil
 import sqlite3
 import sys
 
@@ -50,6 +51,7 @@ class StopArchiving(Exception):
 
 class FaArchiver:
     EXTENSION_RE = re.compile(r"(\.[^\./]+)$")
+    SUBMISSION_RE = re.compile(r"^([0-9]+)([dft])\.")
 
     def __init__(self, artist, base_dir, cookies):
         self._artist = artist
@@ -73,6 +75,10 @@ class FaArchiver:
         self._collect_archive_elements()
         self._download_archive_elements()
         logging.info("Done archiving artist '%s'", self._artist)
+        logging.info(
+            "If you want to import this data into PostyBirb, "
+            + "you have to split it into chunks now."
+        )
 
     def cancel(self):
         self._cancelled = True
@@ -112,7 +118,7 @@ class FaArchiver:
     def _init_db(self):
         self._check_cancelled()
         logging.debug("Initializing database '%s'", self._db_file)
-        self._db = sqlite3.connect(self._db_file)
+        self._open_db()
         with self._db as con:
             con.execute(
                 """
@@ -297,7 +303,113 @@ class FaArchiver:
         with open(path, "wb") as f:
             f.write(data)
 
+    # Chunking
+
+    def chunk(self, chunk_size):
+        if chunk_size < 1 or chunk_size > 99999:
+            raise ValueError(
+                "Invalid chunk size {}, must be between 1 and 99999".format(chunk_size)
+            )
+
+        if not os.path.isfile(self._db_file):
+            raise RuntimeError(
+                (
+                    "Database {} doesn't exist, either you picked the wrong "
+                    + "directory or you didn't archive anything yet"
+                ).format(self._db_file)
+            )
+
+        self._open_db()
+
+        open_count = self._count_open_elements()
+        if open_count != 0:
+            raise RuntimeError(
+                (
+                    "Can't chunk an incomplete archive, there's still "
+                    + "{} element(s) left to download"
+                ).format(open_count)
+            )
+
+        self._chunk_submissions(self._gather_to_chunk(), chunk_size)
+        logging.info(
+            "Done splitting archive into chunks, you can "
+            + "start importing them into PostyBirb now."
+        )
+
+    def _gather_to_chunk(self):
+        submissions = []
+        submissions += self._gather_to_chunk_from(self._gallery_dir, "gallery")
+        submissions += self._gather_to_chunk_from(self._scraps_dir, "scraps")
+        return sorted(submissions, key=lambda submission: submission["id"])
+
+    def _gather_to_chunk_from(self, dir, location):
+        submissions_by_id = {}
+        for name in os.listdir(dir):
+            path = os.path.join(dir, name)
+            match = FaArchiver.SUBMISSION_RE.search(name)
+            if match:
+                submission_id = match[1]
+                file_type = match[2]
+
+                if submission_id in submissions_by_id:
+                    submission = submissions_by_id[submission_id]
+                else:
+                    submission = {"id": int(submission_id), "location": location}
+                    submissions_by_id[submission_id] = submission
+
+                if file_type == "d":
+                    submission["data"] = path
+                elif file_type == "f":
+                    submission["file"] = path
+                elif file_type == "t":
+                    submission["thumb"] = path
+                else:
+                    raise NotImplemented(file_type)
+            else:
+                logging.warning("Not an archive file: '{}'".format(path))
+        return list(submissions_by_id.values())
+
+    def _chunk_submissions(self, submissions, chunk_size):
+        chunk_base_dir = os.path.join(self._base_dir, "chunk{}".format(chunk_size))
+        os.mkdir(chunk_base_dir)
+        offset = 0
+        index = 0
+        while offset < len(submissions):
+            self._make_chunk(
+                index, submissions[offset : offset + chunk_size], chunk_base_dir
+            )
+            offset += chunk_size
+            index += 1
+
+    def _make_chunk(self, index, submissions, chunk_base_dir):
+        chunk_dir = os.path.join(chunk_base_dir, "{:05d}".format(index + 1))
+        logging.info("Creating chunk %s", chunk_dir)
+        os.mkdir(chunk_dir)
+        self._write_archive_chunk(chunk_dir, index)
+        self._write_chunk_files(chunk_dir, submissions)
+
+    def _write_archive_chunk(self, chunk_dir, index):
+        path = os.path.join(chunk_dir, "archive.chunk")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{}\n".format(index))
+
+    def _write_chunk_files(self, chunk_dir, submissions):
+        gallery_dir = os.path.join(chunk_dir, "gallery")
+        scraps_dir = os.path.join(chunk_dir, "scraps")
+        os.mkdir(gallery_dir)
+        os.mkdir(scraps_dir)
+        for submission in submissions:
+            target_dir = (
+                gallery_dir if submission["location"] == "gallery" else scraps_dir
+            )
+            for key in ["data", "file", "thumb"]:
+                if key in submission:
+                    shutil.copy2(submission[key], target_dir)
+
     # Database access.
+
+    def _open_db(self):
+        self._db = sqlite3.connect(self._db_file)
 
     def _get_state_bool(self, key):
         value = self._get_state_int(key)
@@ -355,8 +467,13 @@ class FaArchiver:
                 "update archive_element set archived = 1 where id = ?", (db_id,)
             )
 
+    def _count_open_elements(self):
+        with contextlib.closing(self._db.cursor()) as cur:
+            cur.execute("select count(*) from archive_element where not archived")
+            return cur.fetchone()[0]
 
-def main_cmd(artist, base_dir):
+
+def main_cmd_archive(artist, base_dir):
     error = False
     cookies = requests.cookies.RequestsCookieJar()
     for letter in ["a", "b"]:
@@ -378,6 +495,10 @@ def main_cmd(artist, base_dir):
     FaArchiver(artist, base_dir, cookies).archive()
 
 
+def main_cmd_chunk(base_dir, chunk_size):
+    FaArchiver(None, base_dir, None).chunk(chunk_size)
+
+
 def main_gui():
     from logging.handlers import QueueHandler
     from queue import Empty, SimpleQueue
@@ -396,7 +517,7 @@ def main_gui():
     frm = Frame(root)
     frm.pack(fill="both", expand=True)
     frm.columnconfigure(1, weight=1)
-    frm.rowconfigure(5, weight=1)
+    frm.rowconfigure(6, weight=1)
 
     Label(frm, text="Output directory:").grid(
         column=0, row=0, padx=PADX, pady=PADY, sticky="ew"
@@ -407,6 +528,9 @@ def main_gui():
     )
     Label(frm, text="Cookie b:").grid(
         column=0, row=3, padx=PADX, pady=PADY, sticky="ew"
+    )
+    Label(frm, text="Chunk size:").grid(
+        column=0, row=4, padx=PADX, pady=PADY, sticky="ew"
     )
 
     base_dir_var = StringVar()
@@ -458,16 +582,26 @@ def main_gui():
         column=1, row=3, columnspan=2, padx=PADX, pady=PADY, sticky="ew"
     )
 
+    chunk_size_var = StringVar()
+    chunk_size_var.set("50")
+    chunk_size_entry = Entry(frm)
+    chunk_size_entry["textvariable"] = chunk_size_var
+    chunk_size_entry.grid(
+        column=1, row=4, columnspan=2, padx=PADX, pady=PADY, sticky="ew"
+    )
+
     button_frm = Frame(frm)
-    button_frm.grid(column=0, row=4, columnspan=3, sticky="ew")
+    button_frm.grid(column=0, row=5, columnspan=3, sticky="ew")
 
     text = ScrolledText(frm, state="disabled", wrap="word")
-    text.grid(column=0, row=5, columnspan=4, padx=PADX, pady=PADY, sticky="nsew")
+    text.grid(column=0, row=6, columnspan=4, padx=PADX, pady=PADY, sticky="nsew")
 
     queue = SimpleQueue()
     formatter = logging.Formatter("%(levelname)s: %(message)s\n")
     logging.getLogger().addHandler(QueueHandler(queue))
-    logging.info("Fill in the fields above and press the Archive button to start.")
+    logging.info(
+        "Fill in the fields above and press the Download Archive button to start."
+    )
     logging.info("Output directory is the folder to download stuff to.")
     logging.info("Artist is the FurAffinity username you want to archive.")
     logging.info(
@@ -479,6 +613,11 @@ def main_gui():
     logging.warning(
         "DO NOT SHARE YOUR LOGIN COOKIES WITH ANYONE ELSE. "
         + "They are similar to a password. Keep them to yourself."
+    )
+    logging.info(
+        "After downloading, you can split up the archive into chunks for importing "
+        + "into PostyBirb. It's recommended that you keep the chunk size at less than "
+        + "100, since PostyBirb gets very slow with too many submissions at once."
     )
 
     quit_requested = False
@@ -508,6 +647,8 @@ def main_gui():
             nonlocal archiver_instance
             archiver_instance = None
             archive_button["text"] = "Archive"
+            archive_button["state"] = "normal"
+            chunk_button["state"] = "normal"
             if quit_requested:
                 root.destroy()
                 sys.exit(0)
@@ -566,9 +707,10 @@ def main_gui():
             archiver_instance = make_archiver()
             if archiver_instance:
                 archive_button["text"] = "Cancel"
+                chunk_button["state"] = "disabled"
                 Thread(target=run_archive_thread, args=(archiver_instance,)).start()
 
-    archive_button = Button(button_frm, text="Archive", command=start_cancel)
+    archive_button = Button(button_frm, text="Download Archive", command=start_cancel)
     archive_button.grid(column=0, row=0, padx=PADX, pady=PADY)
 
     def request_quit():
@@ -583,8 +725,57 @@ def main_gui():
             root.destroy()
             sys.exit(0)
 
+    def run_chunk_thread(archiver, chunk_size):
+        try:
+            logging.info("*** Chunking Started ***")
+            archiver.chunk(chunk_size)
+        except Exception as e:
+            logging.error(str(e))
+            raise
+        finally:
+            nonlocal archiver_finished
+            archiver_finished = True
+            logging.info("*** Chunking Ended ***")
+
+    def chunk_up():
+        nonlocal archiver_instance
+        if archiver_instance:
+            return
+
+        errors = []
+        base_dir = base_dir_var.get().strip()
+        if not base_dir:
+            errors.append("Missing output directory to chunk.")
+
+        chunk_size_string = chunk_size_var.get()
+        try:
+            chunk_size = int(chunk_size_string)
+            if chunk_size < 1 or chunk_size > 99999:
+                raise ValueError()
+        except Exception as e:
+            errors.append(
+                "Invalid chunk size. Must be a whole number between 1 and 99999"
+            )
+
+        if errors:
+            messagebox.showerror(
+                title="Error", message="\n\n".join(errors), parent=root
+            )
+        else:
+            archiver_instance = FaArchiver(None, base_dir, None)
+            archive_button["state"] = "disabled"
+            chunk_button["state"] = "disabled"
+            Thread(
+                target=run_chunk_thread, args=(archiver_instance, chunk_size)
+            ).start()
+
+    chunk_button = Button(
+        button_frm, text="Split Archive for PostyBirb", command=chunk_up
+    )
+    chunk_button.grid(column=1, row=0, padx=PADX, pady=PADY)
+
     quit_button = Button(button_frm, text="Quit", command=request_quit)
-    quit_button.grid(column=1, row=0, padx=PADX, pady=PADY)
+    quit_button.grid(column=2, row=0, padx=PADX, pady=PADY)
     root.protocol("WM_DELETE_WINDOW", request_quit)
 
     root.mainloop()
@@ -595,8 +786,13 @@ if __name__ == "__main__":
     if argc == 1:
         main_gui()
     elif argc == 3:
-        main_cmd(sys.argv[1], sys.argv[2])
+        main_cmd_archive(sys.argv[1], sys.argv[2])
+    elif argc == 4 and sys.argv[1] == "chunk":
+        main_cmd_chunk(sys.argv[2], int(sys.argv[3]))
     else:
         program = "fa_archive" if argc < 1 else sys.argv[0]
         logging.error("GUI usage: %s (without arguments)", program)
-        logging.error("Command line usage: %s ARTIST_NAME_FROM_URL DIRECTORY", program)
+        logging.error(
+            "Command line archiving: %s ARTIST_NAME_FROM_URL DIRECTORY", program
+        )
+        logging.error("Command line chunking: %s chunk DIRECTORY CHUNK_SIZE", program)
